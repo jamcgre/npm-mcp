@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -292,5 +293,204 @@ func TestProjectManifestMissingDirectory(t *testing.T) {
 	_, _, err := projectManifest(context.Background(), nil, projectManifestArgs{Directory: filepath.Join(t.TempDir(), "missing")})
 	if err == nil {
 		t.Fatal("expected an error")
+	}
+}
+
+func TestParseParts(t *testing.T) {
+	tests := []struct {
+		in                  string
+		major, minor, patch int
+		ok                  bool
+	}{
+		{in: "19.1.1", major: 19, minor: 1, patch: 1, ok: true},
+		{in: "1.2", major: 1, minor: 2, patch: 0, ok: true},
+		{in: "1", major: 1, minor: 0, patch: 0, ok: true},
+		{in: "0.2.3", major: 0, minor: 2, patch: 3, ok: true},
+		{in: "1.2.3.4", ok: false},
+		{in: "1.2.beta", ok: false},
+		{in: "", ok: false},
+		{in: "^19.1.1", ok: false},
+	}
+
+	for _, test := range tests {
+		major, minor, patch, ok := parseParts(test.in)
+		if ok != test.ok || major != test.major || minor != test.minor || patch != test.patch {
+			t.Fatalf("parseParts(%q) = %d, %d, %d, %t, want %d, %d, %d, %t", test.in, major, minor, patch, ok, test.major, test.minor, test.patch, test.ok)
+		}
+	}
+}
+
+func TestRangeStatusExact(t *testing.T) {
+	tests := []struct {
+		rng    string
+		latest string
+		want   string
+	}{
+		{rng: "1.2.3", latest: "1.2.3", want: "inside"},
+		{rng: "1.0.0", latest: "1.0.0", want: "inside"},
+		{rng: "1.2.3", latest: "1.2.4", want: "outside"},
+		{rng: "1.2.3", latest: "1.2.2", want: "outside"},
+		{rng: "1.2.3+build", latest: "1.2.3", want: "inside"},
+		{rng: "1.2.3", latest: "1.2.3+sha", want: "inside"},
+		{rng: "1.2.3-beta", latest: "1.2.3", want: "unparsed"},
+		{rng: "1.2.3", latest: "1.2.4-beta", want: "unparsed"},
+		{rng: "1.2", latest: "1.2.0", want: "unparsed"},
+		{rng: "1.2.3.4", latest: "1.2.3.4", want: "unparsed"},
+		{rng: "^19.1.1", latest: "19.3.1", want: "inside"},
+		{rng: "^19.1.1", latest: "20.0.0", want: "outside"},
+		{rng: "^1.2", latest: "1.9.0", want: "inside"},
+		{rng: "^1", latest: "1.9.0", want: "inside"},
+		{rng: "^0.2.3", latest: "0.2.9", want: "inside"},
+		{rng: "^0.2.3", latest: "0.3.0", want: "outside"},
+		{rng: "^0.2", latest: "1.0.0", want: "outside"},
+		{rng: "^0.0.3", latest: "0.0.4", want: "outside"},
+		{rng: "^0.0.3", latest: "0.1.0", want: "outside"},
+		{rng: "^0.0", latest: "0.0.5", want: "inside"},
+		{rng: "^0", latest: "0.9.0", want: "inside"},
+		{rng: "^0", latest: "1.0.0", want: "outside"},
+		{rng: "~1.2.3", latest: "1.2.9", want: "inside"},
+		{rng: "~1.2.3", latest: "1.3.0", want: "outside"},
+		{rng: "~1.2.3", latest: "2.0.0", want: "outside"},
+		{rng: "~1.2", latest: "1.2.9", want: "inside"},
+		{rng: "~1", latest: "1.9.0", want: "inside"},
+		{rng: "~1", latest: "2.0.0", want: "outside"},
+		{rng: "~0.2.3", latest: "0.2.9", want: "inside"},
+		{rng: "~0", latest: "0.9.0", want: "inside"},
+		{rng: "^19.1.1", latest: "19.1.1", want: "inside"},
+		{rng: "^19.1.1", latest: "19.1.0", want: "outside"},
+		{rng: "^1.2", latest: "1.2.0", want: "inside"},
+		{rng: "^1", latest: "1.0.0", want: "inside"},
+		{rng: "*", latest: "9.9.9", want: "inside"},
+		{rng: "*", latest: "1.0.0-beta", want: "inside"},
+	}
+
+	for _, test := range tests {
+		got := rangeStatus(test.rng, test.latest)
+		if got != test.want {
+			t.Fatalf("rangeStatus(%q, %q) = %s, want %s", test.rng, test.latest, got, test.want)
+		}
+	}
+}
+
+func TestSupportedRange(t *testing.T) {
+	supported := []string{"*", "^1.2", "^19.1.1", "~1", "~1.2.3", "1.2.3"}
+	for _, rng := range supported {
+		if !supportedRange(rng) {
+			t.Fatalf("supportedRange(%q) = false", rng)
+		}
+	}
+
+	unsupported := []string{"1.2", "foo.bar.baz", "1.2.3-beta", ">=1.2.3", "1.2.3.4"}
+	for _, rng := range unsupported {
+		if supportedRange(rng) {
+			t.Fatalf("supportedRange(%q) = true", rng)
+		}
+	}
+}
+
+func withLookup(t *testing.T, fn func(context.Context, string) (string, error)) {
+	t.Helper()
+	original := lookupLatest
+	t.Cleanup(func() { lookupLatest = original })
+	lookupLatest = fn
+}
+
+func TestDependencyFreshness(t *testing.T) {
+	withLookup(t, func(ctx context.Context, name string) (string, error) {
+		switch name {
+		case "express":
+			return "5.0.0", nil
+		case "left-pad":
+			return "1.0.0", nil
+		case "missing-pkg":
+			return "", errorPackageMissing
+		case "react":
+			return "19.3.1", nil
+		case "typescript":
+			return "5.9.3", nil
+		default:
+			t.Fatalf("unexpected lookup %s", name)
+			return "", nil
+		}
+	})
+
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "package.json"), `{
+		"name": "root",
+		"workspaces": ["client"],
+		"dependencies": {"left-pad": "1.0.0"}
+	}`)
+	writeFile(t, filepath.Join(dir, "client", "package.json"), `{
+		"name": "client",
+		"dependencies": {
+			"express": "^4.21.2",
+			"missing-pkg": "^1.0.0",
+			"react": "^19.1.1",
+			"star": "*",
+			"weird": "git:somewhere"
+		},
+		"devDependencies": {"typescript": "~5.9.2"},
+		"peerDependencies": {"react": "^19.1.1"}
+	}`)
+
+	clientPath := filepath.Join(dir, "client", "package.json")
+	rootPath := filepath.Join(dir, "package.json")
+	_, got, err := dependencyFreshness(context.Background(), nil, dependencyFreshnessArgs{Directory: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := []freshnessRow{
+		{Path: clientPath, Name: "express", Source: "dependencies", Range: "^4.21.2", Latest: "5.0.0", Status: "outside"},
+		{Path: clientPath, Name: "missing-pkg", Source: "dependencies", Range: "^1.0.0", Status: "missing"},
+		{Path: clientPath, Name: "react", Source: "dependencies", Range: "^19.1.1", Latest: "19.3.1", Status: "inside"},
+		{Path: clientPath, Name: "star", Source: "dependencies", Range: "*", Status: "inside"},
+		{Path: clientPath, Name: "weird", Source: "dependencies", Range: "git:somewhere", Status: "unparsed"},
+		{Path: clientPath, Name: "typescript", Source: "devDependencies", Range: "~5.9.2", Latest: "5.9.3", Status: "inside"},
+		{Path: clientPath, Name: "react", Source: "peerDependencies", Range: "^19.1.1", Latest: "19.3.1", Status: "inside"},
+		{Path: rootPath, Name: "left-pad", Source: "dependencies", Range: "1.0.0", Latest: "1.0.0", Status: "inside"},
+	}
+	if len(got.Rows) != len(want) {
+		t.Fatalf("rows %#v", got.Rows)
+	}
+	for i := range want {
+		if got.Rows[i] != want[i] {
+			t.Fatalf("row %d %#v, want %#v", i, got.Rows[i], want[i])
+		}
+	}
+}
+
+func TestDependencyFreshnessEmpty(t *testing.T) {
+	withLookup(t, func(ctx context.Context, name string) (string, error) {
+		t.Fatalf("unexpected lookup %s", name)
+		return "", nil
+	})
+
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "package.json"), `{"name":"app","version":"1.0.0"}`)
+
+	_, got, err := dependencyFreshness(context.Background(), nil, dependencyFreshnessArgs{Directory: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Rows == nil || len(got.Rows) != 0 {
+		t.Fatalf("rows %#v", got.Rows)
+	}
+}
+
+func TestDependencyFreshnessLookupError(t *testing.T) {
+	withLookup(t, func(ctx context.Context, name string) (string, error) {
+		return "", errors.New("registry down")
+	})
+
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "package.json"), `{"dependencies":{"react":"^19.1.1"}}`)
+
+	_, _, err := dependencyFreshness(context.Background(), nil, dependencyFreshnessArgs{Directory: dir})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if errors.Is(err, errorPackageMissing) {
+		t.Fatal("missing package")
 	}
 }

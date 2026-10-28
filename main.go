@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"errors"
+	"sort"
 )
 
 type packageManifestArgs struct {
@@ -76,6 +78,23 @@ type PackageInfoResult struct {
 
 type projectManifestResult struct {
 	Packages []projectPackage `json:"packages"`
+}
+
+type dependencyFreshnessArgs struct {
+	Directory string `json:"directory"`
+}
+
+type freshnessRow struct {
+	Path string `json:"path"`
+	Name string `json:"name"`
+	Source string `json:"source"`
+	Range string `json:"range"`
+	Latest string `json:"latest"`
+	Status string `json:"status"`
+}
+
+type dependencyFreshnessResult struct {
+	Rows []freshnessRow `json:"rows"`
 }
 
 func (license *packageLicense) UnmarshalJSON(data []byte) error {
@@ -190,6 +209,133 @@ func packageInfo(ctx context.Context, req *mcp.CallToolRequest, args packageInfo
 	return nil, PackageInfoResult{Version: doc.Version, License: doc.License}, nil
 }
 
+var errorPackageMissing = errors.New("package not found")
+
+var lookupLatest = func(ctx context.Context, name string) (string, error) {
+	url := "https://registry.npmjs.org/" + name + "/latest"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := http.DefaultClient.Do(httpReq)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return "", errorPackageMissing
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("registry returned %s", resp.Status)
+	}
+
+   var doc struct {
+		Version string `json:"version"`
+	}
+	err = json.NewDecoder(resp.Body).Decode(&doc)
+	if err != nil {
+		return "", err
+	}
+	return doc.Version, nil
+}
+
+func dependencyFreshness(ctx context.Context, req *mcp.CallToolRequest, args dependencyFreshnessArgs) (*mcp.CallToolResult, dependencyFreshnessResult, error) {
+	_, manifests, err := projectManifest(ctx, req, projectManifestArgs{Directory: args.Directory})
+	if err != nil {
+		return nil, dependencyFreshnessResult{}, err
+	}
+
+	rows := []freshnessRow{}
+
+	for _, pkg := range manifests.Packages {
+		for name, rng := range pkg.Manifest.Dependencies {
+			row := freshnessRow{
+				Path: pkg.Path,
+				Name: name,
+				Source: "dependencies",
+				Range: rng,
+			}
+			if !supportedRange(rng) {
+				row.Status = "unparsed"
+			} else if rng == "*" {
+				row.Status = "inside"
+			} else {
+				latest, err := lookupLatest(ctx, name)
+				if errors.Is(err, errorPackageMissing) {
+					row.Status = "missing"
+				} else if err != nil {
+					return nil, dependencyFreshnessResult{}, err
+				} else {
+					row.Latest = latest
+					row.Status = rangeStatus(rng, latest)
+				}
+			}
+			rows = append(rows, row)
+		}
+		for name, rng := range pkg.Manifest.DevDependencies {
+			row := freshnessRow{
+				Path: pkg.Path,
+				Name: name,
+				Source: "devDependencies",
+				Range: rng,
+			}
+			if !supportedRange(rng) {
+				row.Status = "unparsed"
+			} else if rng == "*" {
+				row.Status = "inside"
+			} else {
+				latest, err := lookupLatest(ctx, name)
+				if errors.Is(err, errorPackageMissing) {
+					row.Status = "missing"
+				} else if err != nil {
+					return nil, dependencyFreshnessResult{}, err
+				} else {
+					row.Latest = latest
+					row.Status = rangeStatus(rng, latest)
+				}
+			}
+			rows = append(rows, row)
+		}
+		for name, rng := range pkg.Manifest.PeerDependencies {
+			row := freshnessRow{
+				Path: pkg.Path,
+				Name: name,
+				Source: "peerDependencies",
+				Range: rng,
+			}
+			if !supportedRange(rng) {
+				row.Status = "unparsed"
+			} else if rng == "*" {
+				row.Status = "inside"
+			} else {
+				latest, err := lookupLatest(ctx, name)
+				if errors.Is(err, errorPackageMissing) {
+					row.Status = "missing"
+				} else if err != nil {
+					return nil, dependencyFreshnessResult{}, err
+				} else {
+					row.Latest = latest
+					row.Status = rangeStatus(rng, latest)
+				}
+			}
+			rows = append(rows, row)
+		}
+	}
+
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].Path != rows[j].Path {
+			return rows[i].Path < rows[j].Path
+		}
+		if rows[i].Source != rows[j].Source {
+			return rows[i].Source < rows[j].Source
+		}
+		return rows[i].Name < rows[j].Name
+	})
+
+	return nil, dependencyFreshnessResult{Rows: rows}, nil
+}
+
 func main() {
 	server := mcp.NewServer(&mcp.Implementation{Name: "npm-mcp", Version: "1.0.0"}, nil)
 
@@ -207,6 +353,11 @@ func main() {
 		Name:        "project_manifest",
 		Description: "Read a project's package.json and package.json that match the workspace pattern",
 	}, projectManifest)
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "dependency_freshness",
+		Description: "Report whether the latest registry version of each declared dependency falls outside that dependency's range",
+	}, dependencyFreshness)
 
 	err := server.Run(context.Background(), &mcp.StdioTransport{})
 	if err != nil {
